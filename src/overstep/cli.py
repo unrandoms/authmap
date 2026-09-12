@@ -706,6 +706,170 @@ def _scaffold_next_step(*, full_matrix: bool) -> None:
     )
 
 
+@app.command(name="jwt-idor")
+def jwt_idor_cmd(
+    token_a: str = typer.Option(..., "--token-a", help="JWT for user A (the subject)."),
+    token_b: str = typer.Option(..., "--token-b", help="JWT for user B (the victim)."),
+    base: str = typer.Option(..., help="Base URL of the target API."),
+    paths: Optional[str] = typer.Option(
+        None,
+        help="Comma-separated METHOD:PATH pairs to probe, e.g. 'GET:/users/me,POST:/orders'.",
+    ),
+    insecure: bool = typer.Option(False, help="Disable TLS verification."),
+    timeout: float = typer.Option(15.0, help="Per-request timeout in seconds."),
+):
+    """Probe JWT identity-claim swaps and alg:none attacks for IDOR.
+
+    Decodes both tokens, builds claim-swap and alg:none probe tokens, fires each
+    against every declared endpoint, and flags any 2xx that indicates cross-user
+    access.
+    """
+    from overstep.modules.jwt.idor import (
+        build_claim_swap_probes,
+        decode_jwt,
+        extract_identity_claims,
+        run_idor_scan,
+    )
+
+    try:
+        header_a, payload_a, _ = decode_jwt(token_a)
+        header_b, payload_b, _ = decode_jwt(token_b)
+    except ValueError as exc:
+        console.print(f"[bold red]error:[/] could not decode token: {exc}")
+        raise typer.Exit(code=2)
+
+    claims_a = extract_identity_claims(payload_a)
+    claims_b = extract_identity_claims(payload_b)
+    console.print(f"Token A identity claims: {claims_a}")
+    console.print(f"Token B identity claims: {claims_b}")
+
+    resource_paths = []
+    if paths:
+        for entry in paths.split(","):
+            entry = entry.strip()
+            if ":" in entry:
+                method, _, path = entry.partition(":")
+                resource_paths.append((method.upper(), path))
+
+    if not resource_paths:
+        console.print(
+            "[yellow]warning:[/] no --paths given; JWT probes built but no requests sent"
+        )
+        probes = build_claim_swap_probes(token_a, token_b)
+        for p in probes:
+            console.print(f"  probe: {p.label} ({p.technique})")
+        raise typer.Exit(code=0)
+
+    findings = run_idor_scan(
+        base,
+        token_a,
+        token_b,
+        resource_paths,
+        verify_tls=not insecure,
+        timeout=timeout,
+    )
+
+    if not findings:
+        console.print("[bold green]no JWT IDOR findings[/]")
+        raise typer.Exit(code=0)
+
+    for f in findings:
+        console.print(f"[bold red]FINDING:[/] {f.detail}")
+        console.print(
+            f"  {f.resource_method} {f.resource_path} -> HTTP {f.response_status}"
+        )
+        if f.response_body_snippet:
+            console.print(f"  body: {f.response_body_snippet[:256]}")
+
+    raise typer.Exit(code=1)
+
+
+@app.command(name="burp-import")
+def burp_import_cmd(
+    burp_file: str = typer.Argument(..., help="Path to Burp Suite HTTP history XML export."),
+):
+    """Scaffold a permission matrix from a Burp Suite HTTP history export.
+
+    Parses the Burp XML, canonicalizes paths (numeric segments become {id},
+    UUIDs become {uuid}), deduplicates by (method, canonical_path), and writes
+    a YAML permission-matrix scaffold to stdout.
+    """
+    from overstep.modules.rest.burp import burp_to_yaml
+
+    try:
+        document = burp_to_yaml(burp_file)
+    except (ValueError, OSError) as exc:
+        console.print(f"[bold red]error:[/] {exc}")
+        raise typer.Exit(code=2)
+
+    typer.echo(document)
+    _next_step(
+        "overstep validate <file> --strict",
+        "after filling in PASTE_*/REPLACE_ME_* placeholders",
+    )
+
+
+@app.command(name="price-probe")
+def price_probe_cmd(
+    base: str = typer.Option(..., help="Base URL of the target API."),
+    method: str = typer.Option("POST", help="HTTP method to send."),
+    path: str = typer.Option(..., help="Path to probe (e.g. /orders)."),
+    token: Optional[str] = typer.Option(None, help="Bearer token for authentication."),
+    body: Optional[str] = typer.Option(
+        None,
+        help="JSON request body (string). Fields named price/amount/total/quantity/discount/fee/credit are probed.",
+    ),
+    insecure: bool = typer.Option(False, help="Disable TLS verification."),
+    timeout: float = typer.Option(15.0, help="Per-request timeout in seconds."),
+):
+    """Probe price/quantity fields for BOPLA manipulation vulnerabilities.
+
+    Sends the baseline request, then substitutes boundary values (0, -1, -0.01,
+    0.001, 2147483647, 9999999999, "0", "-1") for each detected monetary or
+    quantity field.  Any 2xx response with a body that differs from the baseline
+    is reported as BOPLA_PRICE_MANIPULATION.
+    """
+    import json as _json
+
+    from overstep.probes.price import run_price_probe
+
+    headers: dict = {}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    json_body = None
+    if body:
+        try:
+            json_body = _json.loads(body)
+        except _json.JSONDecodeError as exc:
+            console.print(f"[bold red]error:[/] --body is not valid JSON: {exc}")
+            raise typer.Exit(code=2)
+
+    findings = run_price_probe(
+        base,
+        method.upper(),
+        path,
+        headers,
+        json_body=json_body,
+        verify_tls=not insecure,
+        timeout=timeout,
+    )
+
+    if not findings:
+        console.print("[bold green]no BOPLA_PRICE_MANIPULATION findings[/]")
+        raise typer.Exit(code=0)
+
+    for f in findings:
+        console.print(f"[bold red]FINDING:[/] {f.detail}")
+        console.print(
+            f"  field: {f.field_name}  original: {f.original_value!r}  "
+            f"probe: {f.probe_value!r}  status: {f.response_status}"
+        )
+        console.print(f"  diff: {f.response_diff}")
+
+    raise typer.Exit(code=1)
+
+
 @app.command()
 def version():
     """Print the overstep version."""
